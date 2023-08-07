@@ -1,0 +1,108 @@
+import torch
+from torch import nn
+import dgl.function as fn
+from dgl.base import DGLError
+from dgl.utils import check_eq_shape, expand_as_pair
+import random
+
+class SAGEConv(nn.Module):
+    def __init__(self, in_feats, out_feats, aggregator_type, feat_drop=0.0, bias=True, norm=None, activation=None):
+        super(SAGEConv, self).__init__()
+        valid_aggre_types = {"mean", "pool"}
+
+        if aggregator_type not in valid_aggre_types:
+            raise DGLError("Invalid aggregator_type. Must be one of {}. "
+                           "But got {!r} instead".format(valid_aggre_types, aggregator_type))
+
+        self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
+        self._out_feats = out_feats
+        self._aggre_type = aggregator_type
+        self.norm = norm
+        self.feat_drop = nn.Dropout(feat_drop)
+        self.activation = activation
+        self.theta = nn.parameter.Parameter(torch.tensor([0.5]))
+        if aggregator_type == "pool":
+            self.fc_pool = nn.Linear(self._in_src_feats, self._in_src_feats)
+
+        self.fc_neigh = nn.Linear(self._in_src_feats, out_feats, bias=bias)
+        self.fc_self = nn.Linear(self._in_dst_feats, out_feats, bias=bias)
+        if bias:
+            self.bias = nn.parameter.Parameter(torch.zeros(self._out_feats))
+        else:
+            self.register_buffer("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        gain = nn.init.calculate_gain("relu")
+        if self._aggre_type == "pool":
+            nn.init.xavier_uniform_(self.fc_pool.weight, gain=gain)
+
+        nn.init.xavier_uniform_(self.fc_neigh.weight, gain=gain)
+
+
+    def forward(self, graph, feat, edge_weight=None):
+        with graph.local_scope():
+            if isinstance(feat, tuple):
+                feat_src = self.feat_drop(feat[0])
+                feat_dst = self.feat_drop(feat[1])
+            else:
+                feat_src = feat_dst = self.feat_drop(feat)
+                if graph.is_block:
+                    feat_dst = feat_src[: graph.number_of_dst_nodes()]
+            msg_fn = fn.copy_u("h", "m")
+
+            if edge_weight is not None:
+                assert edge_weight.shape[0] == graph.num_edges()
+                graph.edata["_edge_weight"] = edge_weight
+                msg_fn = fn.u_mul_e["h", "_edge_weight", "m"]
+
+            h_self = feat_dst
+
+            # 针对没有边的情况
+            if graph.num_edges() == 0:
+                # 目标节点（destination nodes）邻居节点的特征
+                graph.dstdata["neigh"] == torch.zeros(feat_dst.shape[0], self._in_src_feats).to(feat_dst)
+
+            lin_before_mp = self._in_src_feats > self._out_feats
+
+            # Message Passing
+            if self._aggre_type == "mean":
+                # update_all是图数据结构的一个方法，用于进行消息传递
+                graph.srcdata["h"] = (self.fc_neigh(feat_src) if lin_before_mp else feat_src)
+                graph.update_all(msg_fn, fn.mean("m", "neigh"))
+                h_neigh = graph.dstdata["neigh"]
+                if not lin_before_mp:
+                    h_neigh = self.fc_neigh(h_neigh)
+
+            elif self._aggre_type == "pool":
+                graph.srcdata["h"] = nn.ReLU(self.fc_pool(feat_src))
+                graph.update_all(msg_fn, fn.max("m", "neigh"))
+                h_neigh = self.fc_neigh(graph.dstdata["neigh"])
+
+            else:
+                raise KeyError(
+                    "Aggregator type {} not recognized".format(
+                        self._aggre_type
+                    )
+                )
+
+            # theta = random.uniform(0, 1)
+            rst = self.theta * (self.fc_self(h_self)) + (1-self.theta) * h_neigh
+
+            # activation
+            if self.activation is not None:
+                rst = self.activation(rst)
+
+            # normalization
+            if self.norm is not None:
+                self.norm = self.norm(rst)
+
+        return rst, h_self.shape, h_neigh.shape
+
+
+
+
+
+
+
